@@ -1,0 +1,154 @@
+# assistant_app.py
+import streamlit as st
+import pandas as pd
+import google.generativeai as genai
+import fitz 
+import os 
+
+# --- Configuration for Gemini API ---
+try:
+    if "GEMINI_API_KEY" in st.secrets:
+        genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+    else:
+        genai.configure(api_key=os.getenv("GEMINI_API_KEY")) # Ensure this env var is set for local testing
+    model = genai.GenerativeModel('models/gemini-2.5-pro')
+except Exception as e:
+    st.error(f"Gemini API configuration error: {e}. Please ensure your GEMINI_API_KEY is set in .streamlit/secrets.toml or as an environment variable.")
+    # st.stop() # Commented out st.stop() to allow app to run even if API fails for demo purposes, but in production, you might want to stop.
+
+# --- Data Loading and Preprocessing (cached) ---
+@st.cache_data
+def load_all_data():
+    # Load CSV
+    df_csv = pd.read_csv('customer_interaction.csv')
+
+    # Convert 'Event Timestamp'
+    df_csv['Event Timestamp'] = pd.to_datetime(df_csv['Event Timestamp'], errors='coerce')
+    df_csv.dropna(subset=['Event Timestamp'], inplace=True)
+
+    # Ensure 'Response Time (s)' is numeric
+    df_csv['Response Time (s)'] = pd.to_numeric(df_csv['Response Time (s)'], errors='coerce') # Corrected column name
+    df_csv.dropna(subset=['Response Time (s)'], inplace=True) # Corrected column name
+
+    # Handle missing Industry/Customer Segment
+    df_csv['Industry'].fillna('Unknown', inplace=True)
+    df_csv['Customer Segment'].fillna('Unknown', inplace=True)
+
+    # Drop missing Sentiment Score
+    df_csv.dropna(subset=['Sentiment Score'], inplace=True)
+
+    # Convert ID and Name columns to string
+    df_csv['User Name'] = df_csv['User Name'].astype(str) # Corrected column name
+    df_csv['Record ID'] = df_csv['Record ID'].astype(str) # Corrected column name
+
+    # Ensure Department is string
+    df_csv['Department'] = df_csv['Department'].astype(str)
+
+    # Extract text from PDF
+    pdf_text = ""
+    pdf_path = 'div_B_escalation_audit.pdf'
+    try:
+        with fitz.open(pdf_path) as doc:
+            for page in doc:
+                pdf_text += page.get_text()
+    except FileNotFoundError:
+        st.warning(f"PDF file not found: {pdf_path}. Assistant might have limited context.")
+    except Exception as e:
+        st.warning(f"Error reading PDF: {e}. Assistant might have limited context.")
+
+    # Extract text from TXT
+    txt_text = ""
+    txt_path = 'div_B_ops_report.txt'
+    try:
+        with open(txt_path, 'r', encoding='utf-8') as f:
+            txt_text = f.read()
+    except FileNotFoundError:
+        st.warning(f"TXT file not found: {txt_path}. Assistant might have limited context.")
+    except Exception as e:
+        st.warning(f"Error reading TXT: {e}. Assistant might have limited context.")
+
+    return df_csv, pdf_text, txt_text
+
+# Load data once
+df_csv, pdf_text, txt_text = load_all_data()
+
+# --- Streamlit App Layout ---
+st.set_page_config(layout="wide")
+st.title("Root Cause Analysis Assistant (Powered by Gemini)")
+st.write("Ask questions about customer interactions, escalations, and operational insights.")
+
+# Chat history
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Display chat messages from history on app rerun
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# User input
+if prompt := st.chat_input("What would you like to know about root causes?"):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        with st.spinner("Analyzing data and generating response..."):
+            context_snippets = []
+
+            if pdf_text:
+                context_snippets.append(f"--- Escalation Audit Report Snippet ---\n{pdf_text[:2000]}...\n")
+            else:
+                context_snippets.append("--- Escalation Audit Report Snippet ---\n(PDF not loaded or empty)\n")
+
+            if txt_text:
+                context_snippets.append(f"--- Operations Report Snippet ---\n{txt_text[:1000]}...\n")
+            else:
+                context_snippets.append("--- Operations Report Snippet ---\n(TXT not loaded or empty)\n")
+
+            csv_context_notes = []
+            if "escalation" in prompt.lower() or "root cause" in prompt.lower() or "failure" in prompt.lower():
+                escalated_notes_df = df_csv[df_csv['Action Taken'].str.contains('Escalated|Transferred', case=False, na=False)]
+                if not escalated_notes_df.empty:
+                    # Sample notes for context
+                    csv_context_notes.extend(escalated_notes_df['Interaction Notes'].head(5).tolist())
+            if "sentiment" in prompt.lower() or "customer feedback" in prompt.lower():
+                low_sentiment_notes_df = df_csv[df_csv['Sentiment Score'] < 0.3]
+                if not low_sentiment_notes_df.empty:
+                    # Sample notes for context
+                    csv_context_notes.extend(low_sentiment_notes_df['Interaction Notes'].head(3).tolist())
+
+            if csv_context_notes:
+                context_snippets.append(f"--- Relevant Customer Interaction Notes ---\n{' '.join(csv_context_notes)[:1500]}...\n")
+            else:
+                context_snippets.append("--- Relevant Customer Interaction Notes ---\n(No specific notes found for this query)\n")
+
+            full_context = "\n".join(context_snippets)
+
+            model_prompt = f"""
+            You are an expert AI assistant tasked with analyzing customer support and operational data to determine root causes.
+            You have access to information from:
+            1. An escalation audit report (PDF)
+            2. An operations report (TXT)
+            3. Customer interaction records (CSV)
+
+            Here is the relevant context extracted from these documents:
+            {full_context}
+
+            Based *only* on the provided context, answer the following question. If the information is not in the context, state that clearly.
+
+            User's Question: {prompt}
+            """
+
+            try:
+                # Check if model is initialized (in case of API key error, it might not be)
+                if 'model' in locals() or 'model' in globals():
+                    response = model.generate_content(model_prompt)
+                    ai_response = response.text
+                else:
+                    ai_response = "AI model not available due to API configuration issues. Cannot generate response."
+            except Exception as e:
+                ai_response = f"I apologize, but I encountered an error when trying to generate a response from the AI model: {e}\nPlease check your API key and connection."
+
+        st.markdown(ai_response)
+        st.session_state.messages.append({"role": "assistant", "content": ai_response})

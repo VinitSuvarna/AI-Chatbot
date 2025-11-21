@@ -1,0 +1,15 @@
+
+Division B - Technical Ops Trends Q1-Q2 2024
+-------------------------------------------------------
+- Sudden spike in ignored tickets from FinTech accounts during March.
+- Tech department flagged increase in unresolved cases with D2C clients.
+- B2C segment showed response time variance > 1800 seconds frequently.
+- Teh escalation tracker reveals multiple entries for same user ID.
+- Internal audit revealed timestamp anomalies (possibly timezone bugs).
+
+Key Actions:
+* Normalize timestamp formats
+* Investigate duplicate ticket flows across escalation logs
+* Enhance multi-level routing for support interactions
+
+Conclusion: Actionable insights must be derived by linking notes + action history + response lags.
